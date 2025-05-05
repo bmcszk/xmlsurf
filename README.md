@@ -11,6 +11,8 @@ A modern and efficient Go library for XML processing that provides a simple way 
 - Indented XML output
 - Comprehensive error handling
 - Order-independent comparison of XML structures
+- Memory-efficient with optimized string operations
+- Modular, well-structured codebase for maintainability
 
 ## Installation
 
@@ -42,8 +44,10 @@ func main() {
     }
     
     // Access values using XPath-style paths
-    fmt.Println(result["/root/item"])     // Output: [first second]
-    fmt.Println(result["/root/item/@id"]) // Output: [1 2]
+    fmt.Println(result["/root/item[1]"])     // Output: first
+    fmt.Println(result["/root/item[2]"])     // Output: second
+    fmt.Println(result["/root/item[1]/@id"]) // Output: 1
+    fmt.Println(result["/root/item[2]/@id"]) // Output: 2
     
     // Convert back to XML
     var buf strings.Builder
@@ -86,6 +90,25 @@ equal := map1.Equal(map2)
 // Order-independent comparison
 equal := map1.EqualIgnoreOrder(map2)
 ```
+
+## Path Representation
+
+The XMLMap uses XPath-like path expressions as keys:
+
+- Basic element paths: `/root/child`
+- Element indices for repeated elements: `/root/items/item[1]`, `/root/items/item[2]`
+- Attribute paths: `/root/element/@attribute`
+- Namespaced elements: `/ns:root/ns:child`
+
+## Implementation Details
+
+The library has been optimized for performance and memory efficiency:
+
+- Uses a string builder pool to minimize memory allocations
+- Pre-allocates collections with appropriate initial sizes
+- Efficiently handles element repetition with automatic indexing
+- Optimized string operations to reduce concatenation overhead
+- Modular, well-organized code structure for maintainability
 
 ## Error Handling
 
