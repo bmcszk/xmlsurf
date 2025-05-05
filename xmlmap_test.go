@@ -522,6 +522,40 @@ func TestXMLMapDiffsIgnoreOrder(t *testing.T) {
 			expected: []Diff{}, // No diffs when ignoring order
 		},
 		{
+			name: "same values in different order with namespaces",
+			map1: XMLMap{
+				"/ns1:root/ns2:items/ns2:item[1]": "value1",
+				"/ns1:root/ns2:items/ns2:item[2]": "value2",
+				"/ns1:root/ns2:items/ns2:item[3]": "value3",
+			},
+			map2: XMLMap{
+				"/ns1:root/ns2:items/ns2:item[1]": "value3",
+				"/ns1:root/ns2:items/ns2:item[2]": "value1",
+				"/ns1:root/ns2:items/ns2:item[3]": "value2",
+			},
+			expected: []Diff{}, // No diffs when ignoring order
+		},
+		{
+			name: "same values in different order with namespaces and attributes",
+			map1: XMLMap{
+				"/ns1:root/ns2:items/ns2:item[1]/@id":   "1",
+				"/ns1:root/ns2:items/ns2:item[1]/@type": "type1",
+				"/ns1:root/ns2:items/ns2:item[2]/@id":   "2",
+				"/ns1:root/ns2:items/ns2:item[2]/@type": "type2",
+				"/ns1:root/ns2:items/ns2:item[3]/@id":   "3",
+				"/ns1:root/ns2:items/ns2:item[3]/@type": "type3",
+			},
+			map2: XMLMap{
+				"/ns1:root/ns2:items/ns2:item[1]/@id":   "3",
+				"/ns1:root/ns2:items/ns2:item[1]/@type": "type3",
+				"/ns1:root/ns2:items/ns2:item[2]/@id":   "1",
+				"/ns1:root/ns2:items/ns2:item[2]/@type": "type1",
+				"/ns1:root/ns2:items/ns2:item[3]/@id":   "2",
+				"/ns1:root/ns2:items/ns2:item[3]/@type": "type2",
+			},
+			expected: []Diff{}, // No diffs when ignoring order
+		},
+		{
 			name: "different value sets",
 			map1: XMLMap{
 				"/root/items/item[1]": "apple",

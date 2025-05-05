@@ -247,6 +247,52 @@ func TestParseXMLToMap(t *testing.T) {
 				"/root/meta/@id":      "TEST",
 			},
 		},
+		{
+			name: "xml with default namespace",
+			xml: `<?xml version="1.0" encoding="UTF-8"?>
+			<root xmlns="http://www.w3.org/2001/XMLSchema">
+				<items>
+					<item id="1">first</item>
+					<item id="2">second</item>
+				</items>
+				<metadata>
+					<type>test</type>
+					<version>1.0</version>
+				</metadata>
+			</root>`,
+			options: []Option{WithNamespaces(true)},
+			expected: XMLMap{
+				"/root/items/item[1]":     "first",
+				"/root/items/item[2]":     "second",
+				"/root/items/item[1]/@id": "1",
+				"/root/items/item[2]/@id": "2",
+				"/root/metadata/type":     "test",
+				"/root/metadata/version":  "1.0",
+			},
+		},
+		{
+			name: "xml with default namespace and prefixed namespace",
+			xml: `<?xml version="1.0" encoding="UTF-8"?>
+			<root xmlns="http://www.w3.org/2001/XMLSchema" xmlns:ns1="http://example.com/ns1">
+				<items>
+					<item id="1">first</item>
+					<item id="2">second</item>
+				</items>
+				<ns1:metadata>
+					<ns1:type>test</ns1:type>
+					<ns1:version>1.0</ns1:version>
+				</ns1:metadata>
+			</root>`,
+			options: []Option{WithNamespaces(true)},
+			expected: XMLMap{
+				"/root/items/item[1]":            "first",
+				"/root/items/item[2]":            "second",
+				"/root/items/item[1]/@id":        "1",
+				"/root/items/item[2]/@id":        "2",
+				"/root/ns1:metadata/ns1:type":    "test",
+				"/root/ns1:metadata/ns1:version": "1.0",
+			},
+		},
 	}
 
 	for _, tt := range tests {

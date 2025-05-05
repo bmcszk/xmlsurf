@@ -151,12 +151,12 @@ func buildElementName(elementName string, space string, namespaces map[string]st
 	pathBuilder.Reset()
 	if prefix != "" {
 		pathBuilder.WriteString(prefix)
+		pathBuilder.WriteString(":")
+		pathBuilder.WriteString(elementName)
 	} else {
-		// If no prefix found, use the namespace URI as prefix
-		pathBuilder.WriteString(space)
+		// For default namespace (no prefix), just return the element name
+		pathBuilder.WriteString(elementName)
 	}
-	pathBuilder.WriteString(":")
-	pathBuilder.WriteString(elementName)
 	return pathBuilder.String()
 }
 
