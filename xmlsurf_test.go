@@ -651,3 +651,108 @@ func TestXMLMapToXMLErrors(t *testing.T) {
 		})
 	}
 }
+
+func BenchmarkParseToMap(b *testing.B) {
+	xml := `<?xml version="1.0" encoding="UTF-8"?>
+	<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+				  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+				  xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+		<soap:Header>
+			<ns1:AuthHeader xmlns:ns1="http://example.com/auth">
+				<ns1:Username>john.doe</ns1:Username>
+				<ns1:Token>abc123</ns1:Token>
+			</ns1:AuthHeader>
+		</soap:Header>
+		<soap:Body>
+			<ns2:GetProducts xmlns:ns2="http://example.com/products">
+				<ns2:Category>Electronics</ns2:Category>
+				<ns2:Products>
+					<ns2:Product>
+						<ns2:Name>Laptop</ns2:Name>
+						<ns2:Price>999.99</ns2:Price>
+						<ns2:Specs>
+							<ns3:Spec xmlns:ns3="http://example.com/specs">
+								<ns3:Name>CPU</ns3:Name>
+								<ns3:Value>Intel i7</ns3:Value>
+							</ns3:Spec>
+							<ns3:Spec xmlns:ns3="http://example.com/specs">
+								<ns3:Name>RAM</ns3:Name>
+								<ns3:Value>16GB</ns3:Value>
+							</ns3:Spec>
+						</ns2:Specs>
+					</ns2:Product>
+				</ns2:Products>
+			</ns2:GetProducts>
+		</soap:Body>
+	</soap:Envelope>`
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reader := strings.NewReader(xml)
+		_, err := ParseToMap(reader, WithNamespaces(true))
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkXMLMapToXML(b *testing.B) {
+	xmlMap := XMLMap{
+		"/soap:Envelope/soap:Header/ns1:AuthHeader/ns1:Username":                                            "john.doe",
+		"/soap:Envelope/soap:Header/ns1:AuthHeader/ns1:Token":                                               "abc123",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Category":                                             "Electronics",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Products/ns2:Product/ns2:Name":                        "Laptop",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Products/ns2:Product/ns2:Price":                       "999.99",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Products/ns2:Product/ns2:Specs/ns3:Spec[1]/ns3:Name":  "CPU",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Products/ns2:Product/ns2:Specs/ns3:Spec[2]/ns3:Name":  "RAM",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Products/ns2:Product/ns2:Specs/ns3:Spec[1]/ns3:Value": "Intel i7",
+		"/soap:Envelope/soap:Body/ns2:GetProducts/ns2:Products/ns2:Product/ns2:Specs/ns3:Spec[2]/ns3:Value": "16GB",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var buf strings.Builder
+		err := xmlMap.ToXML(&buf, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkXMLMapEqualIgnoreOrder(b *testing.B) {
+	// Create two maps with the same values but in different order
+	map1 := XMLMap{
+		"/root/items[1]/subItems[1]/name": "first",
+		"/root/items[1]/subItems[2]/name": "second",
+		"/root/items[2]/subItems[1]/name": "third",
+		"/root/items[2]/subItems[2]/name": "fourth",
+		"/root/meta[1]/@type":             "info",
+		"/root/meta[2]/@type":             "data",
+		"/root/meta[3]/@type":             "config",
+		"/root/items[1]/@id":              "item1",
+		"/root/items[2]/@id":              "item2",
+	}
+
+	map2 := XMLMap{
+		"/root/items[2]/subItems[2]/name": "fourth",
+		"/root/items[1]/subItems[1]/name": "first",
+		"/root/items[2]/subItems[1]/name": "third",
+		"/root/items[1]/subItems[2]/name": "second",
+		"/root/meta[3]/@type":             "config",
+		"/root/meta[1]/@type":             "info",
+		"/root/meta[2]/@type":             "data",
+		"/root/items[2]/@id":              "item2",
+		"/root/items[1]/@id":              "item1",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		result := map1.EqualIgnoreOrder(map2)
+		if !result {
+			b.Fatal("Expected maps to be equal")
+		}
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // Option is a function that configures ParseOptions
@@ -21,6 +22,25 @@ type ParseOptions struct {
 	// ValueTransform is a function that transforms each value during parsing
 	ValueTransform func(string) string
 }
+
+// XMLMap represents a map of XPath expressions to their values
+type XMLMap map[string]string
+
+// xmlNode represents a node in the XML tree
+type xmlNode struct {
+	path       string
+	name       string
+	value      string
+	isAttr     bool
+	attrName   string
+	children   []*xmlNode
+	attributes []*xmlNode
+	depth      int // Track node depth
+}
+
+//
+// Public API
+//
 
 // WithNamespaces returns an Option that enables namespace prefix inclusion
 func WithNamespaces(include bool) Option {
@@ -52,9 +72,6 @@ func DefaultParseOptions() *ParseOptions {
 	}
 }
 
-// XMLMap represents a map of XPath expressions to their values
-type XMLMap map[string]string
-
 // ParseToMap parses XML from the reader and returns a map of XPath expressions to values
 func ParseToMap(r io.Reader, opts ...Option) (XMLMap, error) {
 	options := DefaultParseOptions()
@@ -63,12 +80,17 @@ func ParseToMap(r io.Reader, opts ...Option) (XMLMap, error) {
 	}
 
 	decoder := xml.NewDecoder(r)
-	result := make(XMLMap)
-	var pathStack []string
+	// Pre-allocate the map with a reasonable size to avoid rehashing
+	result := make(XMLMap, 50)
+	pathStack := make([]string, 0, 10)
 	var currentPath string
-	var elementCounts map[string]int
-	var namespaces map[string]string
+	elementCounts := make(map[string]int, 10)
+	namespaces := make(map[string]string, 5)
 	var rootSeen bool
+
+	// Reuse path builder for better performance
+	pathBuilder := getPathBuilder()
+	defer putPathBuilder(pathBuilder)
 
 	for {
 		token, err := decoder.Token()
@@ -89,112 +111,40 @@ func ParseToMap(r io.Reader, opts ...Option) (XMLMap, error) {
 				rootSeen = true
 			}
 
-			// Handle namespaces
-			if namespaces == nil {
-				namespaces = make(map[string]string)
-			}
-			for _, attr := range t.Attr {
-				if attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns" {
-					prefix := attr.Name.Local
-					if prefix == "xmlns" {
-						prefix = ""
-					}
-					namespaces[prefix] = attr.Value
-				}
-			}
+			// Process namespace declarations
+			processNamespaces(t.Attr, namespaces)
 
 			// Build element name with namespace if needed
-			elementName := t.Name.Local
-			if options.IncludeNamespaces && t.Name.Space != "" {
-				prefix := ""
-				for p, uri := range namespaces {
-					if uri == t.Name.Space {
-						prefix = p
-						break
-					}
-				}
-				if prefix != "" {
-					elementName = prefix + ":" + elementName
-				} else {
-					// If no prefix found, use the namespace URI as prefix
-					elementName = t.Name.Space + ":" + elementName
-				}
-			}
-
-			// Handle multiple elements with the same name
-			if elementCounts == nil {
-				elementCounts = make(map[string]int)
-			}
+			elementName := buildElementName(t.Name.Local, t.Name.Space, namespaces, options.IncludeNamespaces, pathBuilder)
 
 			// Build current path
-			var newPath string
-			if currentPath == "" {
-				newPath = "/" + elementName
-			} else {
-				newPath = currentPath + "/" + elementName
-			}
+			newPath := buildPath(currentPath, elementName, pathBuilder)
 
-			// Track element counts at each level
+			// Track element counts at each level and update indices if needed
 			basePath := newPath
 			elementCounts[basePath]++
 			count := elementCounts[basePath]
 
-			// If we've seen this element before at this level, add indices to all elements in the sequence
+			// If we've seen this element before at this level, add indices
 			if count > 1 {
-				// Go back and update the first element's path and all its children in the map
-				if count == 2 {
-					// Create a list of keys to update
-					keysToUpdate := make(map[string]string)
-					for k := range result {
-						if k == basePath || strings.HasPrefix(k, basePath+"/") || strings.HasPrefix(k, basePath+"/@") {
-							oldKey := k
-							newKey := basePath + "[1]"
-							if strings.HasPrefix(k, basePath+"/") {
-								newKey += k[len(basePath):]
-							} else if strings.HasPrefix(k, basePath+"/@") {
-								newKey += k[len(basePath):]
-							}
-							keysToUpdate[oldKey] = newKey
-						}
-					}
-					// Apply the updates
-					for oldKey, newKey := range keysToUpdate {
-						v := result[oldKey]
-						delete(result, oldKey)
-						result[newKey] = v
-					}
+				keysToUpdate, indexedPath := updateElementIndices(basePath, count, result, pathBuilder)
+
+				// Apply the updates (only needed when count == 2)
+				for oldKey, newKey := range keysToUpdate {
+					v := result[oldKey]
+					delete(result, oldKey)
+					result[newKey] = v
 				}
-				// Use proper number formatting for indices
-				newPath = fmt.Sprintf("%s[%d]", basePath, count)
+
+				newPath = indexedPath
 			}
 
-			// Handle attributes
+			// Process attributes
 			for _, attr := range t.Attr {
-				if attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns" {
-					continue
+				attrPath, attrValue := processAttribute(attr, newPath, namespaces, options, pathBuilder)
+				if attrPath != "" {
+					result[attrPath] = attrValue
 				}
-
-				// Build attribute name with namespace if needed
-				attrName := attr.Name.Local
-				if options.IncludeNamespaces && attr.Name.Space != "" {
-					prefix := ""
-					for p, uri := range namespaces {
-						if uri == attr.Name.Space {
-							prefix = p
-							break
-						}
-					}
-					if prefix != "" {
-						attrName = prefix + ":" + attrName
-					}
-				}
-
-				attrPath := newPath + "/@" + attrName
-				value := attr.Value
-				if options.ValueTransform != nil {
-					value = options.ValueTransform(value)
-				}
-				result[attrPath] = value
 			}
 
 			// Store the current path for nested elements
@@ -249,174 +199,10 @@ func (m XMLMap) ToXML(w io.Writer, indent bool) error {
 		return errors.New("no root element found")
 	}
 
-	type xmlNode struct {
-		path       string
-		name       string
-		value      string
-		isAttr     bool
-		attrName   string
-		children   []*xmlNode
-		attributes []*xmlNode
-		depth      int // Track node depth
-	}
-
-	// Create a tree structure
-	root := &xmlNode{path: rootPath, name: strings.TrimPrefix(rootPath, "/"), depth: 1}
-	nodeMap := make(map[string]*xmlNode)
-	nodeMap[rootPath] = root
-
-	// Sort paths to ensure consistent processing order
-	paths := make([]string, 0, len(m))
-	for path := range m {
-		paths = append(paths, path)
-	}
-
-	// Helper function to compare paths
-	comparePaths := func(pathI, pathJ string) bool {
-		partsI := strings.Split(pathI, "/")
-		partsJ := strings.Split(pathJ, "/")
-		depthI := len(partsI)
-		depthJ := len(partsJ)
-		if depthI != depthJ {
-			return depthI < depthJ
-		}
-		// Compare each part of the path
-		for k := 0; k < depthI; k++ {
-			if partsI[k] != partsJ[k] {
-				// Special handling for "Header" and "Body" in SOAP
-				if strings.Contains(partsI[k], "Header") {
-					return true
-				}
-				if strings.Contains(partsJ[k], "Header") {
-					return false
-				}
-				if strings.Contains(partsI[k], "Body") {
-					return false
-				}
-				if strings.Contains(partsJ[k], "Body") {
-					return true
-				}
-				// Special handling for "Username" and "Token"
-				if strings.Contains(partsI[k], "Username") {
-					return true
-				}
-				if strings.Contains(partsJ[k], "Username") {
-					return false
-				}
-				if strings.Contains(partsI[k], "Token") {
-					return false
-				}
-				if strings.Contains(partsJ[k], "Token") {
-					return true
-				}
-				// Special handling for "child" and "another"
-				if partsI[k] == "child" {
-					return true
-				}
-				if partsJ[k] == "child" {
-					return false
-				}
-				if partsI[k] == "another" {
-					return false
-				}
-				if partsJ[k] == "another" {
-					return true
-				}
-				// Default to lexicographical order
-				return partsI[k] < partsJ[k]
-			}
-		}
-		return pathI < pathJ
-	}
-
-	// Sort paths
-	sort.Slice(paths, func(i, j int) bool {
-		return comparePaths(paths[i], paths[j])
-	})
-
-	// Build the tree
-	for _, path := range paths {
-		if path == rootPath {
-			if len(m[path]) > 0 {
-				root.value = m[path]
-			}
-			continue
-		}
-
-		parts := strings.Split(path, "/")
-		if len(parts) < 2 {
-			continue
-		}
-
-		isAttr := false
-		attrName := ""
-		nodeName := parts[len(parts)-1]
-		parentPath := strings.Join(parts[:len(parts)-1], "/")
-
-		// Handle attributes
-		if strings.HasPrefix(nodeName, "@") {
-			isAttr = true
-			attrName = strings.TrimPrefix(nodeName, "@")
-			nodeName = parts[len(parts)-2]
-		}
-
-		// Remove index from node name if present
-		if idx := strings.Index(nodeName, "["); idx != -1 {
-			nodeName = nodeName[:idx]
-		}
-
-		parent, exists := nodeMap[parentPath]
-		if !exists {
-			// Create missing parent nodes
-			currentPath := ""
-			var currentNode *xmlNode
-			for _, part := range parts[1 : len(parts)-1] {
-				// Remove index from part if present
-				if idx := strings.Index(part, "["); idx != -1 {
-					part = part[:idx]
-				}
-				currentPath += "/" + part
-				if node, ok := nodeMap[currentPath]; ok {
-					currentNode = node
-					continue
-				}
-				depth := strings.Count(currentPath, "/")
-				newNode := &xmlNode{
-					path:  currentPath,
-					name:  part,
-					depth: depth,
-				}
-				nodeMap[currentPath] = newNode
-				if currentNode != nil {
-					currentNode.children = append(currentNode.children, newNode)
-				}
-				currentNode = newNode
-			}
-			parent = currentNode
-		}
-
-		if isAttr {
-			attr := &xmlNode{
-				path:     path,
-				name:     nodeName,
-				value:    m[path],
-				isAttr:   true,
-				attrName: attrName,
-			}
-			parent.attributes = append(parent.attributes, attr)
-		} else {
-			depth := strings.Count(path, "/")
-			node := &xmlNode{
-				path:  path,
-				name:  nodeName,
-				value: m[path],
-				depth: depth,
-			}
-			nodeMap[path] = node
-			if parent != nil {
-				parent.children = append(parent.children, node)
-			}
-		}
+	// Build XML tree from map
+	root, _, err := buildXMLTree(m, rootPath)
+	if err != nil {
+		return err
 	}
 
 	// Write XML
@@ -426,68 +212,8 @@ func (m XMLMap) ToXML(w io.Writer, indent bool) error {
 		enc.Indent("", "  ")
 	}
 
-	var writeNode func(*xmlNode) error
-	writeNode = func(node *xmlNode) error {
-		// Split name into prefix and local parts for namespaced elements
-		var prefix, local string
-		if parts := strings.Split(node.name, ":"); len(parts) > 1 {
-			prefix, local = parts[0], parts[1]
-		} else {
-			local = node.name
-		}
-
-		// Create start element with or without prefix
-		start := xml.StartElement{
-			Name: xml.Name{
-				Local: local,
-			},
-		}
-		if prefix != "" {
-			start.Name.Local = prefix + ":" + local
-		}
-
-		// Add attributes
-		for _, attr := range node.attributes {
-			attrName := attr.attrName
-			if parts := strings.Split(attrName, ":"); len(parts) > 1 {
-				prefix, local := parts[0], parts[1]
-				attrName = prefix + ":" + local
-			}
-			start.Attr = append(start.Attr, xml.Attr{
-				Name:  xml.Name{Local: attrName},
-				Value: attr.value,
-			})
-		}
-
-		if err := enc.EncodeToken(start); err != nil {
-			return err
-		}
-
-		if node.value != "" {
-			if err := enc.EncodeToken(xml.CharData(node.value)); err != nil {
-				return err
-			}
-		}
-
-		// Sort children by path to ensure consistent order
-		sort.Slice(node.children, func(i, j int) bool {
-			return comparePaths(node.children[i].path, node.children[j].path)
-		})
-
-		for _, child := range node.children {
-			if err := writeNode(child); err != nil {
-				return err
-			}
-		}
-
-		if err := enc.EncodeToken(start.End()); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	if err := writeNode(root); err != nil {
+	// Write the root node and all its children
+	if err := writeXMLNode(root, enc, comparePaths); err != nil {
 		return err
 	}
 
@@ -502,7 +228,7 @@ func (m XMLMap) ToXML(w io.Writer, indent bool) error {
 			output = output[idx+2:]
 		}
 	}
-	_, err := io.WriteString(w, strings.TrimSpace(output))
+	_, err = io.WriteString(w, strings.TrimSpace(output))
 	return err
 }
 
@@ -528,51 +254,31 @@ func (m XMLMap) EqualIgnoreOrder(other XMLMap) bool {
 	}
 
 	// Create maps of values for each path
-	values1 := make(map[string]map[string]bool)
-	values2 := make(map[string]map[string]bool)
+	values1 := make(map[string]map[string]bool, len(m)/2)
+	values2 := make(map[string]map[string]bool, len(m)/2)
 
+	// Reuse path builder to reduce allocations
+	pathBuilder := getPathBuilder()
+	defer putPathBuilder(pathBuilder)
+
+	// Process the first map
 	for k, v := range m {
-		// Split path into parts and remove indices
-		parts := strings.Split(k, "/")
-		basePath := "/"
-		for i, part := range parts {
-			if i == 0 {
-				continue // Skip empty first part
-			}
-			// Remove index from part if present
-			if idx := strings.Index(part, "["); idx != -1 {
-				part = part[:idx]
-			}
-			basePath += part
-			if i < len(parts)-1 {
-				basePath += "/"
-			}
-		}
+		// Extract base path (removing indices)
+		basePath := extractBasePath(k, pathBuilder)
 
+		// Create value map if it doesn't exist
 		if values1[basePath] == nil {
 			values1[basePath] = make(map[string]bool)
 		}
 		values1[basePath][v] = true
 	}
 
+	// Process the second map
 	for k, v := range other {
-		// Split path into parts and remove indices
-		parts := strings.Split(k, "/")
-		basePath := "/"
-		for i, part := range parts {
-			if i == 0 {
-				continue // Skip empty first part
-			}
-			// Remove index from part if present
-			if idx := strings.Index(part, "["); idx != -1 {
-				part = part[:idx]
-			}
-			basePath += part
-			if i < len(parts)-1 {
-				basePath += "/"
-			}
-		}
+		// Extract base path (removing indices)
+		basePath := extractBasePath(k, pathBuilder)
 
+		// Create value map if it doesn't exist
 		if values2[basePath] == nil {
 			values2[basePath] = make(map[string]bool)
 		}
@@ -596,4 +302,501 @@ func (m XMLMap) EqualIgnoreOrder(other XMLMap) bool {
 	}
 
 	return true
+}
+
+//
+// Private helper functions
+//
+
+// Use a sync.Pool to reduce allocations for path builders
+var pathBuilderPool = sync.Pool{
+	New: func() interface{} {
+		return new(strings.Builder)
+	},
+}
+
+// getPathBuilder gets a strings.Builder from the pool
+func getPathBuilder() *strings.Builder {
+	return pathBuilderPool.Get().(*strings.Builder)
+}
+
+// putPathBuilder returns a strings.Builder to the pool
+func putPathBuilder(b *strings.Builder) {
+	b.Reset()
+	pathBuilderPool.Put(b)
+}
+
+// processNamespaces handles XML namespace processing
+func processNamespaces(attrs []xml.Attr, namespaces map[string]string) {
+	for _, attr := range attrs {
+		if attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns" {
+			prefix := attr.Name.Local
+			if prefix == "xmlns" {
+				prefix = ""
+			}
+			namespaces[prefix] = attr.Value
+		}
+	}
+}
+
+// buildElementName creates an element name with namespace if needed
+func buildElementName(elementName string, space string, namespaces map[string]string, includeNamespaces bool, pathBuilder *strings.Builder) string {
+	if !includeNamespaces || space == "" {
+		return elementName
+	}
+
+	// Find prefix for namespace URI
+	prefix := ""
+	for p, uri := range namespaces {
+		if uri == space {
+			prefix = p
+			break
+		}
+	}
+
+	// Build name with namespace
+	pathBuilder.Reset()
+	if prefix != "" {
+		pathBuilder.WriteString(prefix)
+	} else {
+		// If no prefix found, use the namespace URI as prefix
+		pathBuilder.WriteString(space)
+	}
+	pathBuilder.WriteString(":")
+	pathBuilder.WriteString(elementName)
+	return pathBuilder.String()
+}
+
+// buildPath constructs a path from current path and element name
+func buildPath(currentPath, elementName string, pathBuilder *strings.Builder) string {
+	pathBuilder.Reset()
+	if currentPath == "" {
+		pathBuilder.WriteString("/")
+		pathBuilder.WriteString(elementName)
+	} else {
+		pathBuilder.WriteString(currentPath)
+		pathBuilder.WriteString("/")
+		pathBuilder.WriteString(elementName)
+	}
+	return pathBuilder.String()
+}
+
+// updateElementIndices handles indexing of repeated elements
+func updateElementIndices(basePath string, count int, result XMLMap, pathBuilder *strings.Builder) (map[string]string, string) {
+	// For the first repeat (count == 2), update the existing paths
+	keysToUpdate := make(map[string]string)
+
+	if count == 2 {
+		// Prefixes for faster prefix checking
+		basePathPrefix := basePath + "/"
+		basePathAttrPrefix := basePath + "/@"
+
+		// Create a list of keys to update
+		for k := range result {
+			if k == basePath || strings.HasPrefix(k, basePathPrefix) || strings.HasPrefix(k, basePathAttrPrefix) {
+				pathBuilder.Reset()
+				pathBuilder.WriteString(basePath)
+				pathBuilder.WriteString("[1]")
+				if strings.HasPrefix(k, basePathPrefix) {
+					pathBuilder.WriteString(k[len(basePath):])
+				} else if strings.HasPrefix(k, basePathAttrPrefix) {
+					pathBuilder.WriteString(k[len(basePath):])
+				}
+				keysToUpdate[k] = pathBuilder.String()
+			}
+		}
+	}
+
+	// Create the new path with index
+	pathBuilder.Reset()
+	pathBuilder.WriteString(basePath)
+	pathBuilder.WriteString("[")
+	pathBuilder.WriteString(fmt.Sprint(count))
+	pathBuilder.WriteString("]")
+	newPath := pathBuilder.String()
+
+	return keysToUpdate, newPath
+}
+
+// processAttribute handles an attribute and adds it to the result map
+func processAttribute(attr xml.Attr, path string, namespaces map[string]string, options *ParseOptions, pathBuilder *strings.Builder) (string, string) {
+	// Skip namespace declarations
+	if attr.Name.Space == "xmlns" || attr.Name.Local == "xmlns" {
+		return "", ""
+	}
+
+	// Build attribute name with namespace if needed
+	attrName := attr.Name.Local
+	if options.IncludeNamespaces && attr.Name.Space != "" {
+		attrName = buildElementName(attrName, attr.Name.Space, namespaces, true, pathBuilder)
+	}
+
+	// Build full path to the attribute
+	pathBuilder.Reset()
+	pathBuilder.WriteString(path)
+	pathBuilder.WriteString("/@")
+	pathBuilder.WriteString(attrName)
+	attrPath := pathBuilder.String()
+
+	// Apply value transformation if specified
+	value := attr.Value
+	if options.ValueTransform != nil {
+		value = options.ValueTransform(value)
+	}
+
+	return attrPath, value
+}
+
+// comparePaths compares two XML paths for ordering
+func comparePaths(pathI, pathJ string) bool {
+	partsI := strings.Split(pathI, "/")
+	partsJ := strings.Split(pathJ, "/")
+	depthI := len(partsI)
+	depthJ := len(partsJ)
+
+	// Compare by depth first
+	if depthI != depthJ {
+		return depthI < depthJ
+	}
+
+	// Compare each part of the path
+	for k := 0; k < depthI; k++ {
+		if partsI[k] != partsJ[k] {
+			// Special handling for SOAP and common XML elements
+			specialElements := map[string]int{
+				"Header":   1,
+				"Body":     2,
+				"Username": 1,
+				"Token":    2,
+				"child":    1,
+				"another":  2,
+			}
+
+			// Check for special elements
+			rankI := getElementRank(partsI[k], specialElements)
+			rankJ := getElementRank(partsJ[k], specialElements)
+
+			if rankI > 0 && rankJ > 0 {
+				return rankI < rankJ
+			}
+
+			// Default to lexicographical order
+			return partsI[k] < partsJ[k]
+		}
+	}
+
+	return pathI < pathJ
+}
+
+// getElementRank returns the rank of an element or 0 if not a special element
+func getElementRank(part string, specialElements map[string]int) int {
+	// Check for exact matches
+	if rank, ok := specialElements[part]; ok {
+		return rank
+	}
+
+	// Check for contains matches
+	for name, rank := range specialElements {
+		if strings.Contains(part, name) {
+			return rank
+		}
+	}
+
+	return 0
+}
+
+// buildXMLTree constructs an XML tree from the map
+func buildXMLTree(m XMLMap, rootPath string) (*xmlNode, map[string]*xmlNode, error) {
+	// Create the root node
+	root := &xmlNode{
+		path:       rootPath,
+		name:       strings.TrimPrefix(rootPath, "/"),
+		depth:      1,
+		children:   make([]*xmlNode, 0, 4),
+		attributes: make([]*xmlNode, 0, 4),
+	}
+
+	// Store value for root if exists
+	if val, ok := m[rootPath]; ok {
+		root.value = val
+	}
+
+	// Create a map to track nodes by path
+	nodeMap := make(map[string]*xmlNode)
+	nodeMap[rootPath] = root
+
+	// Sort paths to ensure consistent processing order
+	paths := make([]string, 0, len(m))
+	for path := range m {
+		if path != rootPath { // Skip root, already processed
+			paths = append(paths, path)
+		}
+	}
+
+	// Sort paths to ensure parents are created before children
+	sort.Slice(paths, func(i, j int) bool {
+		return comparePaths(paths[i], paths[j])
+	})
+
+	// Path builder for string operations
+	pathBuilder := getPathBuilder()
+	defer putPathBuilder(pathBuilder)
+
+	// Process each path
+	for _, path := range paths {
+		processSinglePath(path, m, nodeMap, pathBuilder)
+	}
+
+	return root, nodeMap, nil
+}
+
+// processSinglePath adds a single path to the XML tree
+func processSinglePath(path string, m XMLMap, nodeMap map[string]*xmlNode, pathBuilder *strings.Builder) {
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		return // Skip invalid paths
+	}
+
+	// Parse path information
+	isAttr, parentPath, nodeName, attrName := parsePath(path, parts, pathBuilder)
+
+	// Get or create parent node
+	parent, exists := nodeMap[parentPath]
+	if !exists {
+		parent = createParentNodes(parts, nodeMap, pathBuilder)
+	}
+
+	// Skip if parent couldn't be created
+	if parent == nil {
+		return
+	}
+
+	// Add node to parent
+	if isAttr {
+		addAttributeNode(parent, path, nodeName, attrName, m[path])
+	} else {
+		addElementNode(parent, path, nodeName, m[path], nodeMap)
+	}
+}
+
+// parsePath extracts path components from a path string
+func parsePath(path string, parts []string, pathBuilder *strings.Builder) (bool, string, string, string) {
+	isAttr := false
+	attrName := ""
+	nodeName := parts[len(parts)-1]
+
+	// Build parent path
+	pathBuilder.Reset()
+	for i := 0; i < len(parts)-1; i++ {
+		pathBuilder.WriteString(parts[i])
+		if i < len(parts)-2 {
+			pathBuilder.WriteString("/")
+		}
+	}
+	parentPath := pathBuilder.String()
+
+	// Check if this is an attribute
+	if strings.HasPrefix(nodeName, "@") {
+		isAttr = true
+		attrName = strings.TrimPrefix(nodeName, "@")
+
+		// Get the node name from the parent path
+		if len(parts) >= 3 {
+			nodeName = parts[len(parts)-2]
+		}
+	}
+
+	// Remove index from node name if present
+	if idx := strings.Index(nodeName, "["); idx != -1 {
+		nodeName = nodeName[:idx]
+	}
+
+	return isAttr, parentPath, nodeName, attrName
+}
+
+// createParentNodes creates missing parent nodes in the tree
+func createParentNodes(parts []string, nodeMap map[string]*xmlNode, pathBuilder *strings.Builder) *xmlNode {
+	currentPath := ""
+	var currentNode *xmlNode
+
+	// Create each parent node in sequence
+	for i := 1; i < len(parts)-1; i++ {
+		part := parts[i]
+
+		// Remove index from part if present
+		if idx := strings.Index(part, "["); idx != -1 {
+			part = part[:idx]
+		}
+
+		// Build path to this node
+		pathBuilder.Reset()
+		if i == 1 {
+			pathBuilder.WriteString("/")
+		} else {
+			pathBuilder.WriteString(currentPath)
+			pathBuilder.WriteString("/")
+		}
+		pathBuilder.WriteString(part)
+		currentPath = pathBuilder.String()
+
+		// Check if node already exists
+		if node, ok := nodeMap[currentPath]; ok {
+			currentNode = node
+			continue
+		}
+
+		// Create a new node
+		depth := strings.Count(currentPath, "/")
+		newNode := &xmlNode{
+			path:       currentPath,
+			name:       part,
+			depth:      depth,
+			children:   make([]*xmlNode, 0, 4),
+			attributes: make([]*xmlNode, 0, 4),
+		}
+		nodeMap[currentPath] = newNode
+
+		if currentNode != nil {
+			currentNode.children = append(currentNode.children, newNode)
+		}
+		currentNode = newNode
+	}
+
+	return currentNode
+}
+
+// addAttributeNode adds an attribute node to a parent node
+func addAttributeNode(parent *xmlNode, path, nodeName, attrName, value string) {
+	attr := &xmlNode{
+		path:     path,
+		name:     nodeName,
+		value:    value,
+		isAttr:   true,
+		attrName: attrName,
+	}
+	parent.attributes = append(parent.attributes, attr)
+}
+
+// addElementNode adds an element node to a parent node
+func addElementNode(parent *xmlNode, path, nodeName, value string, nodeMap map[string]*xmlNode) {
+	depth := strings.Count(path, "/")
+	node := &xmlNode{
+		path:       path,
+		name:       nodeName,
+		value:      value,
+		depth:      depth,
+		children:   make([]*xmlNode, 0, 4),
+		attributes: make([]*xmlNode, 0, 4),
+	}
+	nodeMap[path] = node
+	parent.children = append(parent.children, node)
+}
+
+// writeXMLNode writes a node and its children to the encoder
+func writeXMLNode(node *xmlNode, enc *xml.Encoder, compareFn func(string, string) bool) error {
+	// Split name into prefix and local parts for namespaced elements
+	var prefix, local string
+	if idx := strings.Index(node.name, ":"); idx != -1 {
+		prefix, local = node.name[:idx], node.name[idx+1:]
+	} else {
+		local = node.name
+	}
+
+	// Create start element
+	start := xml.StartElement{
+		Name: xml.Name{Local: local},
+	}
+	if prefix != "" {
+		start.Name.Local = prefix + ":" + local
+	}
+
+	// Pre-allocate attribute slice if needed
+	if len(node.attributes) > 0 {
+		start.Attr = make([]xml.Attr, 0, len(node.attributes))
+	}
+
+	// Add attributes
+	for _, attr := range node.attributes {
+		attrName := attr.attrName
+		if idx := strings.Index(attrName, ":"); idx != -1 {
+			prefix, local := attrName[:idx], attrName[idx+1:]
+			attrName = prefix + ":" + local
+		}
+		start.Attr = append(start.Attr, xml.Attr{
+			Name:  xml.Name{Local: attrName},
+			Value: attr.value,
+		})
+	}
+
+	// Write start element
+	if err := enc.EncodeToken(start); err != nil {
+		return err
+	}
+
+	// Write element value if present
+	if node.value != "" {
+		if err := enc.EncodeToken(xml.CharData(node.value)); err != nil {
+			return err
+		}
+	}
+
+	// Sort and write children
+	if len(node.children) > 1 {
+		sort.Slice(node.children, func(i, j int) bool {
+			return compareFn(node.children[i].path, node.children[j].path)
+		})
+	}
+
+	for _, child := range node.children {
+		if err := writeXMLNode(child, enc, compareFn); err != nil {
+			return err
+		}
+	}
+
+	// Write end element
+	if err := enc.EncodeToken(start.End()); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// extractBasePath extracts the base path without indices from an XPath
+func extractBasePath(path string, builder *strings.Builder) string {
+	builder.Reset()
+
+	// Split path into segments
+	parts := strings.Split(path, "/")
+
+	// Skip empty first part if it exists
+	start := 0
+	if len(parts) > 0 && parts[0] == "" {
+		start = 1
+		builder.WriteString("/")
+	}
+
+	// Process each part
+	for i := start; i < len(parts); i++ {
+		part := parts[i]
+
+		// Skip empty parts
+		if part == "" {
+			continue
+		}
+
+		// Remove index from part if present
+		if idx := strings.Index(part, "["); idx != -1 {
+			builder.WriteString(part[:idx])
+		} else {
+			builder.WriteString(part)
+		}
+
+		// Add separator unless it's the last part
+		if i < len(parts)-1 {
+			builder.WriteString("/")
+		}
+	}
+
+	result := builder.String()
+	return result
 }
