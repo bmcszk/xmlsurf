@@ -26,6 +26,40 @@ type ParseOptions struct {
 // XMLMap represents a map of XPath expressions to their values
 type XMLMap map[string]string
 
+// Diff represents a difference between two XMLMaps
+type Diff struct {
+	Path       string   // The XPath where the difference was found
+	LeftValue  string   // Value in the left XMLMap (empty if path doesn't exist)
+	RightValue string   // Value in the right XMLMap (empty if path doesn't exist)
+	Type       DiffType // Type of difference
+}
+
+// DiffType indicates the type of difference between XMLMaps
+type DiffType int
+
+const (
+	// DiffMissing indicates a path exists in right but not in left
+	DiffMissing DiffType = iota
+	// DiffExtra indicates a path exists in left but not in right
+	DiffExtra
+	// DiffValue indicates a path exists in both but values differ
+	DiffValue
+)
+
+// String returns a human-readable description of the difference
+func (d Diff) String() string {
+	switch d.Type {
+	case DiffMissing:
+		return fmt.Sprintf("Missing path: %s (right value: %q)", d.Path, d.RightValue)
+	case DiffExtra:
+		return fmt.Sprintf("Extra path: %s (left value: %q)", d.Path, d.LeftValue)
+	case DiffValue:
+		return fmt.Sprintf("Value mismatch at %s: %q != %q", d.Path, d.LeftValue, d.RightValue)
+	default:
+		return fmt.Sprintf("Unknown diff type at %s", d.Path)
+	}
+}
+
 // xmlNode represents a node in the XML tree
 type xmlNode struct {
 	path       string
@@ -234,28 +268,108 @@ func (m XMLMap) ToXML(w io.Writer, indent bool) error {
 
 // Equal returns true if two XMLMaps are equal
 func (m XMLMap) Equal(other XMLMap) bool {
-	if len(m) != len(other) {
-		return false
-	}
+	diffs := m.findDiffs(other)
+	return len(diffs) == 0
+}
 
-	for k, v := range m {
-		if other[k] != v {
-			return false
+// Diffs returns a list of differences between two XMLMaps
+// It compares exact paths and values, considering element order
+func (m XMLMap) Diffs(other XMLMap) []Diff {
+	return m.findDiffs(other)
+}
+
+// findDiffs is a helper method that finds differences between two XMLMaps
+// It is used by both Equal and Diffs to avoid code duplication
+func (m XMLMap) findDiffs(other XMLMap) []Diff {
+	diffs := make([]Diff, 0)
+
+	// Quick size check
+	if len(m) != len(other) {
+		// Maps have different sizes - find specific differences
+
+		// Find paths in m that are missing or have different values in other
+		for path, value := range m {
+			otherValue, exists := other[path]
+			if !exists {
+				diffs = append(diffs, Diff{
+					Path:      path,
+					LeftValue: value,
+					Type:      DiffExtra,
+				})
+			} else if value != otherValue {
+				diffs = append(diffs, Diff{
+					Path:       path,
+					LeftValue:  value,
+					RightValue: otherValue,
+					Type:       DiffValue,
+				})
+			}
+		}
+
+		// Find paths in other that are missing in m
+		for path, value := range other {
+			if _, exists := m[path]; !exists {
+				diffs = append(diffs, Diff{
+					Path:       path,
+					RightValue: value,
+					Type:       DiffMissing,
+				})
+			}
+		}
+	} else {
+		// Maps have same size - just check for differing values
+		for path, value := range m {
+			otherValue, exists := other[path]
+			if !exists {
+				diffs = append(diffs, Diff{
+					Path:      path,
+					LeftValue: value,
+					Type:      DiffExtra,
+				})
+			} else if value != otherValue {
+				diffs = append(diffs, Diff{
+					Path:       path,
+					LeftValue:  value,
+					RightValue: otherValue,
+					Type:       DiffValue,
+				})
+			}
 		}
 	}
 
-	return true
+	// Sort diffs by path for consistent output
+	if len(diffs) > 0 {
+		sort.Slice(diffs, func(i, j int) bool {
+			return diffs[i].Path < diffs[j].Path
+		})
+	}
+
+	return diffs
 }
 
 // EqualIgnoreOrder returns true if two XMLMaps are equal ignoring the order of elements
 func (m XMLMap) EqualIgnoreOrder(other XMLMap) bool {
-	if len(m) != len(other) {
-		return false
-	}
+	diffs := m.findDiffsIgnoreOrder(other)
+	return len(diffs) == 0
+}
+
+// DiffsIgnoreOrder returns a list of differences between two XMLMaps, ignoring element order
+func (m XMLMap) DiffsIgnoreOrder(other XMLMap) []Diff {
+	return m.findDiffsIgnoreOrder(other)
+}
+
+// findDiffsIgnoreOrder is a helper method that finds differences between two XMLMaps ignoring element order
+// It is used by both EqualIgnoreOrder and DiffsIgnoreOrder to avoid code duplication
+func (m XMLMap) findDiffsIgnoreOrder(other XMLMap) []Diff {
+	diffs := make([]Diff, 0)
 
 	// Create maps of values for each path
 	values1 := make(map[string]map[string]bool, len(m)/2)
 	values2 := make(map[string]map[string]bool, len(m)/2)
+
+	// Maps to keep track of original paths before normalization
+	pathsMap1 := make(map[string][]string)
+	pathsMap2 := make(map[string][]string)
 
 	// Reuse path builder to reduce allocations
 	pathBuilder := getPathBuilder()
@@ -265,6 +379,9 @@ func (m XMLMap) EqualIgnoreOrder(other XMLMap) bool {
 	for k, v := range m {
 		// Extract base path (removing indices)
 		basePath := extractBasePath(k, pathBuilder)
+
+		// Track the original paths for this base path
+		pathsMap1[basePath] = append(pathsMap1[basePath], k)
 
 		// Create value map if it doesn't exist
 		if values1[basePath] == nil {
@@ -278,6 +395,9 @@ func (m XMLMap) EqualIgnoreOrder(other XMLMap) bool {
 		// Extract base path (removing indices)
 		basePath := extractBasePath(k, pathBuilder)
 
+		// Track the original paths for this base path
+		pathsMap2[basePath] = append(pathsMap2[basePath], k)
+
 		// Create value map if it doesn't exist
 		if values2[basePath] == nil {
 			values2[basePath] = make(map[string]bool)
@@ -285,23 +405,144 @@ func (m XMLMap) EqualIgnoreOrder(other XMLMap) bool {
 		values2[basePath][v] = true
 	}
 
-	// Compare value sets for each path
-	for k, v1 := range values1 {
-		v2, exists := values2[k]
-		if !exists {
-			return false
-		}
-		if len(v1) != len(v2) {
-			return false
-		}
-		for val := range v1 {
-			if !v2[val] {
-				return false
+	// Quick size check for optimization
+	if len(values1) != len(values2) {
+		// Different number of base paths - report all differences
+		// Find missing paths and value differences
+		collectDiffsFromValueSets(values1, values2, pathsMap1, pathsMap2, m, other, &diffs)
+	} else {
+		// Same number of base paths - check for value differences
+		for basePath, vals1 := range values1 {
+			vals2, exists := values2[basePath]
+			if !exists || !mapSetsEqual(vals1, vals2) {
+				// Either missing path or different values
+				collectDiffsForBasePath(basePath, vals1, vals2, exists,
+					pathsMap1, pathsMap2, m, other, &diffs)
 			}
 		}
 	}
 
+	// Sort diffs by path for consistent output
+	if len(diffs) > 0 {
+		sort.Slice(diffs, func(i, j int) bool {
+			return diffs[i].Path < diffs[j].Path
+		})
+	}
+
+	return diffs
+}
+
+// mapSetsEqual checks if two maps containing sets of values are equal
+func mapSetsEqual(set1, set2 map[string]bool) bool {
+	if len(set1) != len(set2) {
+		return false
+	}
+
+	for v := range set1 {
+		if !set2[v] {
+			return false
+		}
+	}
+
 	return true
+}
+
+// collectDiffsFromValueSets collects all differences between two value sets
+// This is used when the number of base paths differs
+func collectDiffsFromValueSets(
+	values1, values2 map[string]map[string]bool,
+	pathsMap1, pathsMap2 map[string][]string,
+	m, other XMLMap,
+	diffs *[]Diff) {
+
+	// Find paths in values1 that are missing or have different values in values2
+	for basePath, vals1 := range values1 {
+		vals2, exists := values2[basePath]
+		if !exists {
+			// Base path missing from other
+			for _, originalPath := range pathsMap1[basePath] {
+				*diffs = append(*diffs, Diff{
+					Path:      originalPath,
+					LeftValue: m[originalPath],
+					Type:      DiffExtra,
+				})
+			}
+		} else {
+			// Compare values - collect differences
+			collectDiffsForBasePath(basePath, vals1, vals2, exists,
+				pathsMap1, pathsMap2, m, other, diffs)
+		}
+	}
+
+	// Find paths in values2 that are missing in values1
+	for basePath, _ := range values2 {
+		if _, exists := values1[basePath]; !exists {
+			// Base path missing from m
+			for _, originalPath := range pathsMap2[basePath] {
+				*diffs = append(*diffs, Diff{
+					Path:       originalPath,
+					RightValue: other[originalPath],
+					Type:       DiffMissing,
+				})
+			}
+		}
+	}
+}
+
+// collectDiffsForBasePath collects all differences for a specific base path
+func collectDiffsForBasePath(
+	basePath string,
+	vals1, vals2 map[string]bool,
+	exists bool,
+	pathsMap1, pathsMap2 map[string][]string,
+	m, other XMLMap,
+	diffs *[]Diff) {
+
+	if !exists {
+		// Path exists in left but not in right
+		for _, originalPath := range pathsMap1[basePath] {
+			*diffs = append(*diffs, Diff{
+				Path:      originalPath,
+				LeftValue: m[originalPath],
+				Type:      DiffExtra,
+			})
+		}
+		return
+	}
+
+	// Check for values in vals1 that don't exist in vals2
+	for val := range vals1 {
+		if !vals2[val] {
+			// Find an original path with this value
+			for _, path := range pathsMap1[basePath] {
+				if m[path] == val {
+					*diffs = append(*diffs, Diff{
+						Path:      path,
+						LeftValue: val,
+						Type:      DiffExtra,
+					})
+					break
+				}
+			}
+		}
+	}
+
+	// Check for values in vals2 that don't exist in vals1
+	for val := range vals2 {
+		if !vals1[val] {
+			// Find an original path with this value
+			for _, path := range pathsMap2[basePath] {
+				if other[path] == val {
+					*diffs = append(*diffs, Diff{
+						Path:       path,
+						RightValue: val,
+						Type:       DiffMissing,
+					})
+					break
+				}
+			}
+		}
+	}
 }
 
 //
@@ -558,7 +799,7 @@ func processSinglePath(path string, m XMLMap, nodeMap map[string]*xmlNode, pathB
 	}
 
 	// Parse path information
-	isAttr, parentPath, nodeName, attrName := parsePath(path, parts, pathBuilder)
+	isAttr, parentPath, nodeName, attrName := parsePath(parts, pathBuilder)
 
 	// Get or create parent node
 	parent, exists := nodeMap[parentPath]
@@ -580,7 +821,7 @@ func processSinglePath(path string, m XMLMap, nodeMap map[string]*xmlNode, pathB
 }
 
 // parsePath extracts path components from a path string
-func parsePath(path string, parts []string, pathBuilder *strings.Builder) (bool, string, string, string) {
+func parsePath(parts []string, pathBuilder *strings.Builder) (bool, string, string, string) {
 	isAttr := false
 	attrName := ""
 	nodeName := parts[len(parts)-1]

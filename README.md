@@ -89,7 +89,32 @@ equal := map1.Equal(map2)
 
 // Order-independent comparison
 equal := map1.EqualIgnoreOrder(map2)
+
+// Get detailed differences between XMLMaps
+diffs := map1.Diffs(map2)
+for _, diff := range diffs {
+    fmt.Println(diff.String()) // Human-readable description of the difference
+}
+
+// Get detailed differences ignoring element order
+diffs := map1.DiffsIgnoreOrder(map2)
 ```
+
+The `Diff` struct provides detailed information about differences between XML maps:
+
+```go
+type Diff struct {
+    Path       string   // The XPath where the difference was found
+    LeftValue  string   // Value in the left XMLMap (empty if path doesn't exist)
+    RightValue string   // Value in the right XMLMap (empty if path doesn't exist)
+    Type       DiffType // Type of difference (DiffMissing, DiffExtra, or DiffValue)
+}
+```
+
+Diff types:
+- `DiffMissing` - Path exists in right but not in left
+- `DiffExtra` - Path exists in left but not in right
+- `DiffValue` - Path exists in both but values differ
 
 ## Path Representation
 

@@ -756,3 +756,302 @@ func BenchmarkXMLMapEqualIgnoreOrder(b *testing.B) {
 		}
 	}
 }
+
+func TestXMLMapDiffs(t *testing.T) {
+	tests := []struct {
+		name     string
+		map1     XMLMap
+		map2     XMLMap
+		expected []Diff
+	}{
+		{
+			name: "identical maps return no diffs",
+			map1: XMLMap{
+				"/root/item[1]": "value1",
+				"/root/item[2]": "value2",
+			},
+			map2: XMLMap{
+				"/root/item[1]": "value1",
+				"/root/item[2]": "value2",
+			},
+			expected: []Diff{},
+		},
+		{
+			name: "missing path in map2",
+			map1: XMLMap{
+				"/root/item[1]": "value1",
+				"/root/item[2]": "value2",
+			},
+			map2: XMLMap{
+				"/root/item[1]": "value1",
+			},
+			expected: []Diff{
+				{
+					Path:      "/root/item[2]",
+					LeftValue: "value2",
+					Type:      DiffExtra,
+				},
+			},
+		},
+		{
+			name: "extra path in map2",
+			map1: XMLMap{
+				"/root/item[1]": "value1",
+			},
+			map2: XMLMap{
+				"/root/item[1]": "value1",
+				"/root/item[2]": "value2",
+			},
+			expected: []Diff{
+				{
+					Path:       "/root/item[2]",
+					RightValue: "value2",
+					Type:       DiffMissing,
+				},
+			},
+		},
+		{
+			name: "differing values",
+			map1: XMLMap{
+				"/root/item[1]": "value1",
+				"/root/item[2]": "old_value",
+			},
+			map2: XMLMap{
+				"/root/item[1]": "value1",
+				"/root/item[2]": "new_value",
+			},
+			expected: []Diff{
+				{
+					Path:       "/root/item[2]",
+					LeftValue:  "old_value",
+					RightValue: "new_value",
+					Type:       DiffValue,
+				},
+			},
+		},
+		{
+			name: "multiple differences",
+			map1: XMLMap{
+				"/root/item[1]":          "value1",
+				"/root/item[2]":          "old_value",
+				"/root/extra":            "extra_value",
+				"/root/nested/something": "nested",
+			},
+			map2: XMLMap{
+				"/root/item[1]":           "value1",
+				"/root/item[2]":           "new_value",
+				"/root/different/element": "different",
+			},
+			expected: []Diff{
+				{
+					Path:       "/root/different/element",
+					RightValue: "different",
+					Type:       DiffMissing,
+				},
+				{
+					Path:      "/root/extra",
+					LeftValue: "extra_value",
+					Type:      DiffExtra,
+				},
+				{
+					Path:       "/root/item[2]",
+					LeftValue:  "old_value",
+					RightValue: "new_value",
+					Type:       DiffValue,
+				},
+				{
+					Path:      "/root/nested/something",
+					LeftValue: "nested",
+					Type:      DiffExtra,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diffs := tt.map1.Diffs(tt.map2)
+
+			if len(diffs) != len(tt.expected) {
+				t.Errorf("Diffs() returned %d diffs, want %d", len(diffs), len(tt.expected))
+				return
+			}
+
+			// Check each diff matches the expected diff
+			for i, diff := range diffs {
+				if i >= len(tt.expected) {
+					break
+				}
+
+				expected := tt.expected[i]
+				if diff.Path != expected.Path || diff.LeftValue != expected.LeftValue ||
+					diff.RightValue != expected.RightValue || diff.Type != expected.Type {
+					t.Errorf("Diff %d: got %v, want %v", i, diff, expected)
+				}
+			}
+		})
+	}
+}
+
+func TestXMLMapDiffsIgnoreOrder(t *testing.T) {
+	tests := []struct {
+		name     string
+		map1     XMLMap
+		map2     XMLMap
+		expected []Diff
+	}{
+		{
+			name: "identical maps return no diffs",
+			map1: XMLMap{
+				"/root/items/item[1]": "value1",
+				"/root/items/item[2]": "value2",
+			},
+			map2: XMLMap{
+				"/root/items/item[1]": "value1",
+				"/root/items/item[2]": "value2",
+			},
+			expected: []Diff{},
+		},
+		{
+			name: "same values in different order",
+			map1: XMLMap{
+				"/root/items/item[1]": "value1",
+				"/root/items/item[2]": "value2",
+			},
+			map2: XMLMap{
+				"/root/items/item[1]": "value2",
+				"/root/items/item[2]": "value1",
+			},
+			expected: []Diff{}, // No diffs when ignoring order
+		},
+		{
+			name: "different value sets",
+			map1: XMLMap{
+				"/root/items/item[1]": "apple",
+				"/root/items/item[2]": "banana",
+			},
+			map2: XMLMap{
+				"/root/items/item[1]": "apple",
+				"/root/items/item[2]": "orange",
+			},
+			expected: []Diff{
+				{
+					Path:      "/root/items/item[2]", // Path might vary but contains item
+					LeftValue: "banana",
+					Type:      DiffExtra,
+				},
+				{
+					Path:       "/root/items/item[2]", // Path might vary but contains item
+					RightValue: "orange",
+					Type:       DiffMissing,
+				},
+			},
+		},
+		{
+			name: "missing element group",
+			map1: XMLMap{
+				"/root/items/item[1]": "apple",
+				"/root/items/item[2]": "banana",
+				"/root/other/data[1]": "something",
+			},
+			map2: XMLMap{
+				"/root/items/item[1]": "apple",
+				"/root/items/item[2]": "banana",
+			},
+			expected: []Diff{
+				{
+					Path:      "/root/other/data[1]",
+					LeftValue: "something",
+					Type:      DiffExtra,
+				},
+			},
+		},
+		{
+			name: "extra element group",
+			map1: XMLMap{
+				"/root/items/item[1]": "apple",
+				"/root/items/item[2]": "banana",
+			},
+			map2: XMLMap{
+				"/root/items/item[1]": "apple",
+				"/root/items/item[2]": "banana",
+				"/root/other/data[1]": "something",
+			},
+			expected: []Diff{
+				{
+					Path:       "/root/other/data[1]",
+					RightValue: "something",
+					Type:       DiffMissing,
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			diffs := tt.map1.DiffsIgnoreOrder(tt.map2)
+
+			if len(diffs) != len(tt.expected) {
+				t.Errorf("DiffsIgnoreOrder() returned %d diffs, want %d. Diffs: %v",
+					len(diffs), len(tt.expected), diffs)
+				return
+			}
+
+			// For DiffsIgnoreOrder, we need to check more flexibly as the exact paths might vary
+			// Create maps of diffs by type and value for easier comparison
+			expectedDiffs := make(map[DiffType]map[string]bool)
+			actualDiffs := make(map[DiffType]map[string]bool)
+
+			// Initialize maps
+			for _, diffType := range []DiffType{DiffMissing, DiffExtra, DiffValue} {
+				expectedDiffs[diffType] = make(map[string]bool)
+				actualDiffs[diffType] = make(map[string]bool)
+			}
+
+			// Populate expected diffs
+			for _, diff := range tt.expected {
+				switch diff.Type {
+				case DiffMissing:
+					expectedDiffs[DiffMissing][diff.RightValue] = true
+				case DiffExtra:
+					expectedDiffs[DiffExtra][diff.LeftValue] = true
+				case DiffValue:
+					key := diff.LeftValue + "!=" + diff.RightValue
+					expectedDiffs[DiffValue][key] = true
+				}
+			}
+
+			// Populate actual diffs
+			for _, diff := range diffs {
+				switch diff.Type {
+				case DiffMissing:
+					actualDiffs[DiffMissing][diff.RightValue] = true
+				case DiffExtra:
+					actualDiffs[DiffExtra][diff.LeftValue] = true
+				case DiffValue:
+					key := diff.LeftValue + "!=" + diff.RightValue
+					actualDiffs[DiffValue][key] = true
+				}
+			}
+
+			// Compare diff maps
+			for diffType, expectedValues := range expectedDiffs {
+				actualValues := actualDiffs[diffType]
+				for value := range expectedValues {
+					if !actualValues[value] {
+						t.Errorf("Missing expected %v diff with value %q", diffType, value)
+					}
+				}
+			}
+
+			for diffType, actualValues := range actualDiffs {
+				expectedValues := expectedDiffs[diffType]
+				for value := range actualValues {
+					if !expectedValues[value] {
+						t.Errorf("Unexpected %v diff with value %q", diffType, value)
+					}
+				}
+			}
+		})
+	}
+}
