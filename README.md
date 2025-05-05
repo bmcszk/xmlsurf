@@ -17,7 +17,7 @@ A modern and efficient Go library for XML processing that provides a simple way 
 ## Installation
 
 ```bash
-go get github.com/bmcszk/xmlsurf
+go get github.com/bmcszk/xmlsurf@v1.0.0
 ```
 
 ## Quick Start
